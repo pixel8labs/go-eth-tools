@@ -13,6 +13,8 @@ import (
 
 type HandlerFn func(ctx context.Context, msg types.Log)
 
+// EventListener listens for events from the smart contract.
+// This is already equipped with log & trace using github.com/pixel8labs/logtrace package.
 type EventListener struct {
 	appName              string
 	maxConcurrentProcess int
