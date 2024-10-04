@@ -3,11 +3,13 @@ package eventlistener
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/pixel8labs/logtrace/log"
 	"github.com/pixel8labs/logtrace/trace"
 )
 
@@ -77,6 +79,16 @@ func (e *EventListener) Listen(ctx context.Context) error {
 	}
 	defer sub.Unsubscribe()
 
+	logFields := log.Fields{
+		"contract_address":       e.contractAddress.String(),
+		"max_concurrent_process": e.maxConcurrentProcess,
+	}
+	log.Info(ctx, logFields, "EventListener: listening for events...")
+
+	// WaitGroup to wait until all process is done.
+	var wg sync.WaitGroup
+	// maxProcessCh is used to limit the number of concurrent process.
+	maxProcessCh := make(chan int, e.maxConcurrentProcess)
 	for {
 		select {
 		case err := <-sub.Err():
@@ -84,24 +96,41 @@ func (e *EventListener) Listen(ctx context.Context) error {
 				return fmt.Errorf("subscription error: %w", err)
 			}
 		case msg := <-logs:
-			e.processLog(ctx, msg)
+			wg.Add(1)
+			maxProcessCh <- 1
+			// Do process async
+			go e.processLog(ctx, msg)
+			<-maxProcessCh
+			wg.Done()
+		case <-ctx.Done():
+			// Wait until all process is done.
+			log.Info(ctx, logFields, "EventListener: received stop signal. Waiting for all process to finish...")
+			wg.Wait()
+			log.Info(ctx, logFields, "EventListener: stopped")
+			return nil
 		}
 	}
-	<-ctx.Done()
-
-	return nil
 }
 
 func (e *EventListener) processLog(ctx context.Context, msg types.Log) {
 	fn, ok := e.handlers[msg.Topics[0]]
 	if !ok {
+		// If no handler, just ignore and return.
 		return
 	}
+
 	ctx, span := trace.StartSpan(
 		ctx,
 		e.appName+"-listener",
 		msg.Topics[0].String(),
 	)
 	defer span.End()
+
+	logFields := log.Fields{
+		"event_name": msg.Topics[0].String(),
+		"event":      msg,
+	}
+	log.Info(ctx, logFields, "EventListener: processing event...")
 	fn(ctx, msg)
+	log.Info(ctx, logFields, "EventListener: processed event")
 }
