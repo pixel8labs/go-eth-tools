@@ -35,14 +35,6 @@ func WithMaxConcurrentProcess(max int) NewOption {
 	}
 }
 
-// WithAbi sets the ABI of the contract.
-// Abi will be used to automatically registers & unpack the event data.
-func WithAbi(abi string) NewOption {
-	return func(e *EventListener) {
-		// TODO
-	}
-}
-
 // New creates a new EventListener.
 func New(
 	appName string,
@@ -69,7 +61,7 @@ func (e *EventListener) RegisterHandler(eventHash common.Hash, fn HandlerFn) {
 	e.handlers[eventHash] = fn
 }
 
-// Listen starts listening for events.
+// Listen starts listening for events. To gracefully stop, call Stop().
 func (e *EventListener) Listen(ctx context.Context) error {
 	logs := make(chan types.Log)
 	sub, err := e.ethClient.SubscribeFilterLogs(ctx, ethereum.FilterQuery{
@@ -116,6 +108,7 @@ func (e *EventListener) Listen(ctx context.Context) error {
 	}
 }
 
+// Stop stops the listener.
 func (e *EventListener) Stop() {
 	e.stopCh <- struct{}{}
 }
