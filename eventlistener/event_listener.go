@@ -23,6 +23,7 @@ type EventListener struct {
 	ethClient            *ethclient.Client
 	contractAddress      common.Address
 	handlers             map[common.Hash]HandlerFn
+	stopCh               chan struct{}
 }
 
 type NewOption func(*EventListener)
@@ -48,17 +49,19 @@ func New(
 	ethClient *ethclient.Client,
 	contractAddress common.Address,
 	opts ...NewOption,
-) (*EventListener, error) {
+) *EventListener {
 	e := &EventListener{
 		appName:              appName,
 		maxConcurrentProcess: 100,
 		ethClient:            ethClient,
 		contractAddress:      contractAddress,
+		stopCh:               make(chan struct{}),
+		handlers:             make(map[common.Hash]HandlerFn),
 	}
 	for _, opt := range opts {
 		opt(e)
 	}
-	return e, nil
+	return e
 }
 
 // RegisterHandler registers a new event handler.
@@ -102,14 +105,19 @@ func (e *EventListener) Listen(ctx context.Context) error {
 			go e.processLog(ctx, msg)
 			<-maxProcessCh
 			wg.Done()
-		case <-ctx.Done():
+		case <-e.stopCh:
 			// Wait until all process is done.
-			log.Info(ctx, logFields, "EventListener: received stop signal. Waiting for all process to finish...")
+			log.Info(ctx, logFields, "EventListener: received stop signal. Waiting for all processes to finish...")
 			wg.Wait()
+			close(e.stopCh)
 			log.Info(ctx, logFields, "EventListener: stopped")
 			return nil
 		}
 	}
+}
+
+func (e *EventListener) Stop() {
+	e.stopCh <- struct{}{}
 }
 
 func (e *EventListener) processLog(ctx context.Context, msg types.Log) {
@@ -127,8 +135,7 @@ func (e *EventListener) processLog(ctx context.Context, msg types.Log) {
 	defer span.End()
 
 	logFields := log.Fields{
-		"event_name": msg.Topics[0].String(),
-		"event":      msg,
+		"event": msg,
 	}
 	log.Info(ctx, logFields, "EventListener: processing event...")
 	fn(ctx, msg)
