@@ -10,7 +10,6 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/joho/godotenv"
 	"github.com/pixel8labs/go-eth-tools/eventlistener"
 	"github.com/pixel8labs/logtrace/log"
@@ -38,14 +37,8 @@ func main() {
 		panic(err)
 	}
 
-	client, err := ethclient.Dial(websocketUrl)
-	if err != nil {
-		panic(err)
-	}
-	defer client.Close()
-
 	// Create a new event listener.
-	eventListener := eventlistener.New(appName, client, contractAddress)
+	eventListener := eventlistener.New(appName, []string{websocketUrl}, contractAddress)
 
 	// Register the handler function.
 	eventListener.RegisterHandler(erc20AbiJson.Events["Transfer"].ID, func(ctx context.Context, msg types.Log) {
