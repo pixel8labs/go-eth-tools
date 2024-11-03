@@ -29,6 +29,7 @@ func main() {
 	trace.InitTracer()
 
 	websocketUrl := os.Getenv("WEBSOCKET_URL")
+	websocketUrl2 := os.Getenv("WEBSOCKET_URL2")
 	contractAddress := common.HexToAddress(os.Getenv("ERC20_CONTRACT_ADDRESS"))
 
 	// We can use either ABI or the generated Go code from the contract to unpack the event.
@@ -38,7 +39,7 @@ func main() {
 	}
 
 	// Create a new event listener.
-	eventListener := eventlistener.New(appName, []string{websocketUrl}, contractAddress)
+	eventListener := eventlistener.New(appName, []string{websocketUrl, websocketUrl2}, contractAddress)
 
 	// Register the handler function.
 	eventListener.RegisterHandler(erc20AbiJson.Events["Transfer"].ID, func(ctx context.Context, msg types.Log) {
