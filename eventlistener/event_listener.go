@@ -193,11 +193,10 @@ func (e *EventListener) processLog(ctx context.Context, msg types.Log) {
 	if _, found := e.deduplicationCache.Get(string(msg.Data)); found {
 		log.Info(ctx, logFields, "EventListener: duplicated event, skipping...")
 		return
-	} else {
-		// Set the cache to true at the very beginning of the process to prevent
-		// multiple incoming messages at the same time to be processed multiple times.
-		e.deduplicationCache.Set(string(msg.Data), true, cache.DefaultExpiration)
 	}
+	// Set the cache to true at the very beginning of the process to prevent
+	// multiple incoming messages at the same time to be processed multiple times.
+	e.deduplicationCache.Set(string(msg.Data), true, cache.DefaultExpiration)
 
 	log.Info(ctx, logFields, "EventListener: processing event...")
 	fn(ctx, msg)
