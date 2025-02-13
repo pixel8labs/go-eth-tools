@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/patrickmn/go-cache"
 	"github.com/pixel8labs/logtrace/log"
 	"github.com/pixel8labs/logtrace/trace"
 )
@@ -20,35 +22,51 @@ type HandlerFn func(ctx context.Context, msg types.Log)
 type EventListener struct {
 	appName              string
 	maxConcurrentProcess int
-	ethClient            *ethclient.Client
+	maxConnectionRetry   int
+	websocketUrls        []string
 	contractAddress      common.Address
 	handlers             map[common.Hash]HandlerFn
-	stopCh               chan struct{}
+	deduplicationCache   *cache.Cache
+	cancelFunc           context.CancelFunc
 }
 
 type NewOption func(*EventListener)
 
-// WithMaxConcurrentProcess sets the maximum number of concurrent processes. The default is 100.
+// WithMaxConcurrentProcess sets the maximum number of concurrent processes for each websocket URL. The default is 100.
 func WithMaxConcurrentProcess(max int) NewOption {
 	return func(e *EventListener) {
 		e.maxConcurrentProcess = max
 	}
 }
 
+// WithMaxConnectionRetry sets the maximum number of retry if we fail to connect to websocket URL
+// or if the connection is disconnected. The default is 10.
+func WithMaxConnectionRetry(max int) NewOption {
+	return func(e *EventListener) {
+		e.maxConnectionRetry = max
+	}
+}
+
 // New creates a new EventListener.
+// websocketUrls is a list of websocket URLs to connect to the Ethereum node.
+// The expectation is at least one URL is provided. If multiple URLs are provided,
+// the event listener will try to connect & listen to all of them, and expect at least one of them is working.
+// The event listener will also perform best-effort deduplication using in-memory cache.
 func New(
 	appName string,
-	ethClient *ethclient.Client,
+	websocketUrls []string,
 	contractAddress common.Address,
 	opts ...NewOption,
 ) *EventListener {
 	e := &EventListener{
 		appName:              appName,
 		maxConcurrentProcess: 100,
-		ethClient:            ethClient,
+		maxConnectionRetry:   10,
+		websocketUrls:        websocketUrls,
 		contractAddress:      contractAddress,
-		stopCh:               make(chan struct{}),
 		handlers:             make(map[common.Hash]HandlerFn),
+		// The deduplication cache only needs to be very short-lived.
+		deduplicationCache: cache.New(1*time.Minute, 2*time.Minute),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -63,8 +81,57 @@ func (e *EventListener) RegisterHandler(eventHash common.Hash, fn HandlerFn) {
 
 // Listen starts listening for events. To gracefully stop, call Stop().
 func (e *EventListener) Listen(ctx context.Context) error {
+	// If no Ethereum node is connected, return error.
+	if len(e.websocketUrls) == 0 {
+		return fmt.Errorf("EventListener: no websocket URL provided")
+	}
+
+	ctx, e.cancelFunc = context.WithCancel(ctx)
+
+	// Start listening for events.
+	var wg sync.WaitGroup
+	// Map websocket URL to error.
+	errs := make(map[string]error)
+	for _, url := range e.websocketUrls {
+		wg.Add(1)
+		go func() {
+			for i := 0; i < e.maxConnectionRetry; i++ {
+				ethClient, err := ethclient.Dial(url)
+				if err != nil {
+					log.Error(ctx, err, log.Fields{
+						"url": url,
+					}, "EventListener: failed to connect to Ethereum node")
+					errs[url] = err
+					continue
+				}
+
+				if err := e.runListener(ctx, url, ethClient); err != nil {
+					log.Error(ctx, err, log.Fields{
+						"url": url,
+					}, "EventListener: failed to run listener")
+					errs[url] = err
+					continue
+				}
+				// If successfully run, remove the error and break the loop.
+				delete(errs, url)
+				break
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	// If found error, return it.
+	if len(errs) != 0 {
+		return fmt.Errorf("found errors: %v", errs)
+	}
+
+	return nil
+}
+
+func (e *EventListener) runListener(ctx context.Context, websocketUrl string, ethClient *ethclient.Client) error {
 	logs := make(chan types.Log)
-	sub, err := e.ethClient.SubscribeFilterLogs(ctx, ethereum.FilterQuery{
+	sub, err := ethClient.SubscribeFilterLogs(ctx, ethereum.FilterQuery{
 		Addresses: []common.Address{
 			e.contractAddress,
 		},
@@ -77,6 +144,7 @@ func (e *EventListener) Listen(ctx context.Context) error {
 	logFields := log.Fields{
 		"contract_address":       e.contractAddress.String(),
 		"max_concurrent_process": e.maxConcurrentProcess,
+		"url":                    websocketUrl,
 	}
 	log.Info(ctx, logFields, "EventListener: listening for events...")
 
@@ -93,15 +161,18 @@ func (e *EventListener) Listen(ctx context.Context) error {
 		case msg := <-logs:
 			wg.Add(1)
 			maxProcessCh <- 1
-			// Do process async
-			go e.processLog(ctx, msg)
-			<-maxProcessCh
-			wg.Done()
-		case <-e.stopCh:
+			// Do process async.
+			go func() {
+				e.processLog(ctx, msg)
+				<-maxProcessCh
+				wg.Done()
+			}()
+		case <-ctx.Done():
 			// Wait until all process is done.
 			log.Info(ctx, logFields, "EventListener: received stop signal. Waiting for all processes to finish...")
 			wg.Wait()
-			close(e.stopCh)
+			// Close connection.
+			ethClient.Close()
 			log.Info(ctx, logFields, "EventListener: stopped")
 			return nil
 		}
@@ -110,7 +181,7 @@ func (e *EventListener) Listen(ctx context.Context) error {
 
 // Stop stops the listener.
 func (e *EventListener) Stop() {
-	e.stopCh <- struct{}{}
+	e.cancelFunc()
 }
 
 func (e *EventListener) processLog(ctx context.Context, msg types.Log) {
@@ -130,6 +201,16 @@ func (e *EventListener) processLog(ctx context.Context, msg types.Log) {
 	logFields := log.Fields{
 		"event": msg,
 	}
+
+	// Deduplication logic. If the event is already processed, skip.
+	if _, found := e.deduplicationCache.Get(string(msg.Data)); found {
+		log.Info(ctx, logFields, "EventListener: duplicated event, skipping...")
+		return
+	}
+	// Set the cache to true at the very beginning of the process to prevent
+	// multiple incoming messages at the same time to be processed multiple times.
+	e.deduplicationCache.Set(string(msg.Data), true, cache.DefaultExpiration)
+
 	log.Info(ctx, logFields, "EventListener: processing event...")
 	fn(ctx, msg)
 	log.Info(ctx, logFields, "EventListener: processed event")
