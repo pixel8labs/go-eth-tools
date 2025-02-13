@@ -11,9 +11,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/joho/godotenv"
-	"github.com/pixel8labs/go-eth-tools/eventlistener"
 	"github.com/pixel8labs/logtrace/log"
 	"github.com/pixel8labs/logtrace/trace"
+
+	"github.com/pixel8labs/go-eth-tools/eventlistener"
 )
 
 const appName = "erc20-event-listener"
@@ -62,7 +63,7 @@ func main() {
 
 	go func() {
 		if err := eventListener.Listen(ctx); err != nil {
-			panic(err)
+			log.Error(ctx, err, log.Fields{}, "EventListener.Listen: Error on listening")
 		}
 		done <- struct{}{}
 	}()

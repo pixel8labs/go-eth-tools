@@ -22,6 +22,7 @@ type HandlerFn func(ctx context.Context, msg types.Log)
 type EventListener struct {
 	appName              string
 	maxConcurrentProcess int
+	maxConnectionRetry   int
 	websocketUrls        []string
 	contractAddress      common.Address
 	handlers             map[common.Hash]HandlerFn
@@ -35,6 +36,14 @@ type NewOption func(*EventListener)
 func WithMaxConcurrentProcess(max int) NewOption {
 	return func(e *EventListener) {
 		e.maxConcurrentProcess = max
+	}
+}
+
+// WithMaxConnectionRetry sets the maximum number of retry if we fail to connect to websocket URL
+// or if the connection is disconnected. The default is 10.
+func WithMaxConnectionRetry(max int) NewOption {
+	return func(e *EventListener) {
+		e.maxConnectionRetry = max
 	}
 }
 
@@ -52,6 +61,7 @@ func New(
 	e := &EventListener{
 		appName:              appName,
 		maxConcurrentProcess: 100,
+		maxConnectionRetry:   10,
 		websocketUrls:        websocketUrls,
 		contractAddress:      contractAddress,
 		handlers:             make(map[common.Hash]HandlerFn),
@@ -71,46 +81,49 @@ func (e *EventListener) RegisterHandler(eventHash common.Hash, fn HandlerFn) {
 
 // Listen starts listening for events. To gracefully stop, call Stop().
 func (e *EventListener) Listen(ctx context.Context) error {
-	// Connect to all the Ethereum nodes.
-	var mapWsUrlToEthClient = make(map[string]*ethclient.Client)
-	for _, url := range e.websocketUrls {
-		ethClient, err := ethclient.Dial(url)
-		if err != nil {
-			log.Error(context.Background(), err, log.Fields{
-				"url": url,
-			}, "EventListener: failed to connect to Ethereum node")
-			continue
-		}
-		mapWsUrlToEthClient[url] = ethClient
-	}
-
 	// If no Ethereum node is connected, return error.
-	if len(mapWsUrlToEthClient) == 0 {
-		return fmt.Errorf("EventListener: no Ethereum node is connected")
+	if len(e.websocketUrls) == 0 {
+		return fmt.Errorf("EventListener: no websocket URL provided")
 	}
 
 	ctx, e.cancelFunc = context.WithCancel(ctx)
 
 	// Start listening for events.
 	var wg sync.WaitGroup
-	var errs []error
-	for wsUrl, ethClient := range mapWsUrlToEthClient {
+	// Map websocket URL to error.
+	errs := make(map[string]error)
+	for _, url := range e.websocketUrls {
 		wg.Add(1)
 		go func() {
-			if err := e.runListener(ctx, wsUrl, ethClient); err != nil {
-				log.Error(ctx, err, log.Fields{
-					"url": wsUrl,
-				}, "EventListener: failed to run listener")
-				errs = append(errs, err)
+			for i := 0; i < e.maxConnectionRetry; i++ {
+				ethClient, err := ethclient.Dial(url)
+				if err != nil {
+					log.Error(ctx, err, log.Fields{
+						"url": url,
+					}, "EventListener: failed to connect to Ethereum node")
+					errs[url] = err
+					continue
+				}
+
+				if err := e.runListener(ctx, url, ethClient); err != nil {
+					log.Error(ctx, err, log.Fields{
+						"url": url,
+					}, "EventListener: failed to run listener")
+					errs[url] = err
+					continue
+				}
+				// If successfully run, remove the error and break the loop.
+				delete(errs, url)
+				break
 			}
 			wg.Done()
 		}()
 	}
 	wg.Wait()
 
-	// If all listener returns error, return all errors.
-	if len(errs) == len(mapWsUrlToEthClient) {
-		return fmt.Errorf("all listeners failed to start listening: %v", errs)
+	// If found error, return it.
+	if len(errs) != 0 {
+		return fmt.Errorf("found errors: %v", errs)
 	}
 
 	return nil
